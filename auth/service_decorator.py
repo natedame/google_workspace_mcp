@@ -674,14 +674,13 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
                 )
             service_param_names.add(param_name)
 
-        filtered_params = [p for p in params if p.name not in service_param_names]
-
-        # In OAuth 2.1 mode, remove user_google_email from the signature
-        if is_oauth21_enabled():
-            filtered_params = [
-                p for p in filtered_params
-                if p.name != 'user_google_email'
-            ]
+        oauth21_enabled_for_signature = is_oauth21_enabled()
+        filtered_params = [
+            p
+            for p in params
+            if p.name not in service_param_names
+            and (not oauth21_enabled_for_signature or p.name != "user_google_email")
+        ]
 
         wrapper_sig = original_sig.replace(parameters=filtered_params)
 
@@ -760,7 +759,7 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
             # Call the original function with refresh error handling
             try:
                 # Bind provided arguments against the wrapper signature (which excludes injected services)
-                bound_wrapper_args = wrapper_sig.bind_partial(*args, **kwargs)
+                bound_wrapper_args = wrapper_sig.bind(*args, **kwargs)
                 bound_wrapper_args.apply_defaults()
                 call_arguments = dict(bound_wrapper_args.arguments)
 
@@ -769,8 +768,7 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
                 if is_oauth21_enabled():
                     call_arguments["user_google_email"] = user_google_email
 
-                bound_original_args = original_sig.bind_partial(**call_arguments)
-                return await func(*bound_original_args.args, **bound_original_args.kwargs)
+                return await func(**call_arguments)
             except RefreshError as e:
                 # Handle token refresh errors gracefully
                 error_message = _handle_token_refresh_error(
