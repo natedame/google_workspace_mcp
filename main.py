@@ -23,6 +23,12 @@ load_dotenv(dotenv_path=dotenv_path)
 # Suppress googleapiclient discovery cache warning
 logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 
+# Apply session recovery patch early - this patches the MCP library to handle
+# unknown session IDs gracefully (e.g., after server restart) instead of returning
+# 400 errors. Must be done before any server initialization.
+from core.session_recovery import apply_session_recovery_patch
+apply_session_recovery_patch()
+
 reload_oauth_config()
 
 logging.basicConfig(
