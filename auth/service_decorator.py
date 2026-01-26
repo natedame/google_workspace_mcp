@@ -363,6 +363,7 @@ def _extract_oauth20_user_email(
 ) -> str:
     """
     Extract user email for OAuth 2.0 mode from function arguments.
+    Falls back to USER_GOOGLE_EMAIL environment variable if not provided.
 
     Args:
         args: Positional arguments passed to wrapper
@@ -373,14 +374,25 @@ def _extract_oauth20_user_email(
         User email string
 
     Raises:
-        Exception: If user_google_email parameter not found
+        Exception: If user_google_email parameter not found and no default configured
     """
-    bound_args = wrapper_sig.bind(*args, **kwargs)
+    import os
+    bound_args = wrapper_sig.bind_partial(*args, **kwargs)
     bound_args.apply_defaults()
 
     user_google_email = bound_args.arguments.get("user_google_email")
+
+    # Fall back to environment variable if not provided
     if not user_google_email:
-        raise Exception("'user_google_email' parameter is required but was not found.")
+        user_google_email = os.getenv("USER_GOOGLE_EMAIL")
+        if user_google_email:
+            logger.debug(f"Using default USER_GOOGLE_EMAIL: {user_google_email}")
+
+    if not user_google_email:
+        raise Exception(
+            "'user_google_email' parameter is required but was not found. "
+            "Either pass it explicitly or set USER_GOOGLE_EMAIL environment variable."
+        )
     return user_google_email
 
 
@@ -576,12 +588,20 @@ def require_google_service(
 
         # Create a new signature for the wrapper that excludes the 'service' parameter.
         # In OAuth 2.1 mode, also exclude 'user_google_email' since it's automatically determined.
+        # In OAuth 2.0 mode with USER_GOOGLE_EMAIL set, also exclude user_google_email.
+        import os
+        default_email = os.getenv("USER_GOOGLE_EMAIL")
         if is_oauth21_enabled():
             # Remove both 'service' and 'user_google_email' parameters
             filtered_params = [p for p in params[1:] if p.name != "user_google_email"]
             wrapper_sig = original_sig.replace(parameters=filtered_params)
+        elif default_email:
+            # OAuth 2.0 with default email - also remove user_google_email from signature
+            filtered_params = [p for p in params[1:] if p.name != "user_google_email"]
+            wrapper_sig = original_sig.replace(parameters=filtered_params)
+            logger.debug(f"OAuth 2.0 with default email {default_email} - hiding user_google_email param")
         else:
-            # Only remove 'service' parameter for OAuth 2.0 mode
+            # Only remove 'service' parameter for OAuth 2.0 mode without default
             wrapper_sig = original_sig.replace(parameters=params[1:])
 
         @wraps(func)
@@ -595,10 +615,15 @@ def require_google_service(
             )
 
             # Extract user_google_email based on OAuth mode
+            default_email = os.getenv("USER_GOOGLE_EMAIL")
             if is_oauth21_enabled():
                 user_google_email = _extract_oauth21_user_email(
                     authenticated_user, func.__name__
                 )
+            elif default_email:
+                # Use default email from environment
+                user_google_email = default_email
+                logger.debug(f"[{func.__name__}] Using default USER_GOOGLE_EMAIL: {user_google_email}")
             else:
                 user_google_email = _extract_oauth20_user_email(
                     args, kwargs, wrapper_sig
@@ -663,8 +688,9 @@ def require_google_service(
                 raise
 
             try:
-                # In OAuth 2.1 mode, we need to add user_google_email to kwargs since it was removed from signature
-                if is_oauth21_enabled():
+                # Add user_google_email to kwargs if it was removed from signature
+                # (OAuth 2.1 mode or OAuth 2.0 with default email)
+                if is_oauth21_enabled() or default_email:
                     kwargs["user_google_email"] = user_google_email
 
                 # Prepend the fetched service object to the original arguments
@@ -714,12 +740,15 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
     def decorator(func: Callable) -> Callable:
         original_sig = inspect.signature(func)
 
+        import os
         service_param_names = {config["param_name"] for config in service_configs}
         params = list(original_sig.parameters.values())
+        default_email = os.getenv("USER_GOOGLE_EMAIL")
 
-        # Remove injected service params from the wrapper signature; drop user_google_email only for OAuth 2.1.
+        # Remove injected service params from the wrapper signature
         filtered_params = [p for p in params if p.name not in service_param_names]
-        if is_oauth21_enabled():
+        # Also remove user_google_email if OAuth 2.1 or default email is configured
+        if is_oauth21_enabled() or default_email:
             filtered_params = [
                 p for p in filtered_params if p.name != "user_google_email"
             ]
@@ -738,6 +767,10 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
                 user_google_email = _extract_oauth21_user_email(
                     authenticated_user, tool_name
                 )
+            elif default_email:
+                # Use default email from environment
+                user_google_email = default_email
+                logger.debug(f"[{tool_name}] Using default USER_GOOGLE_EMAIL: {user_google_email}")
             else:
                 user_google_email = _extract_oauth20_user_email(
                     args, kwargs, wrapper_sig
@@ -801,8 +834,9 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
 
             # Call the original function with refresh error handling
             try:
-                # In OAuth 2.1 mode, we need to add user_google_email to kwargs since it was removed from signature
-                if is_oauth21_enabled():
+                # Add user_google_email to kwargs if it was removed from signature
+                # (OAuth 2.1 mode or OAuth 2.0 with default email)
+                if is_oauth21_enabled() or default_email:
                     kwargs["user_google_email"] = user_google_email
 
                 return await func(*args, **kwargs)
