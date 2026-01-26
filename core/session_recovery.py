@@ -60,17 +60,30 @@ async def _patched_handle_stateful_request(
         return
 
     # NEW: Handle unknown session ID gracefully - create a new session
+    # but also map the old session ID to the new transport for continuity
+    stale_session_id = None
     if request_mcp_session_id is not None:
         logger.warning(
             f"Unknown session ID received: {request_mcp_session_id[:8]}... "
             "(possibly from before server restart). Creating new session."
         )
+        stale_session_id = request_mcp_session_id
         # Fall through to new session creation below
 
     # New session case (or recovery from unknown session)
     logger.debug("Creating new transport")
     async with self._session_creation_lock:
-        new_session_id = uuid4().hex
+        # For stale session recovery, reuse the client's session ID
+        # This allows the client to continue using their existing session ID
+        # without needing to handle session ID changes
+        if stale_session_id is not None:
+            new_session_id = stale_session_id
+            logger.info(
+                f"Reusing client's stale session ID for continuity: {new_session_id[:8]}..."
+            )
+        else:
+            new_session_id = uuid4().hex
+
         http_transport = StreamableHTTPServerTransport(
             mcp_session_id=new_session_id,
             is_json_response_enabled=self.json_response,
@@ -81,7 +94,7 @@ async def _patched_handle_stateful_request(
 
         assert http_transport.mcp_session_id is not None
         self._server_instances[http_transport.mcp_session_id] = http_transport
-        logger.info(f"Created new transport with session ID: {new_session_id}")
+        logger.info(f"Created new transport with session ID: {new_session_id[:8]}...")
 
         # Define the server runner
         async def run_server(
