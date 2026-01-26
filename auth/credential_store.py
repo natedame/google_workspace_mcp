@@ -8,6 +8,8 @@ supporting multiple backends configurable via environment variables.
 import os
 import json
 import logging
+import tempfile
+import fcntl
 from abc import ABC, abstractmethod
 from typing import Optional, List
 from datetime import datetime
@@ -118,21 +120,34 @@ class LocalDirectoryCredentialStore(CredentialStore):
     def _get_credential_path(self, user_email: str) -> str:
         """Get the file path for a user's credentials."""
         if not os.path.exists(self.base_dir):
-            os.makedirs(self.base_dir)
+            os.makedirs(self.base_dir, mode=0o700)  # Restrictive dir permissions
             logger.info(f"Created credentials directory: {self.base_dir}")
+        else:
+            # Ensure existing directory has correct permissions
+            try:
+                os.chmod(self.base_dir, 0o700)
+            except OSError as e:
+                logger.warning(f"Could not set directory permissions: {e}")
         return os.path.join(self.base_dir, f"{user_email}.json")
 
     def get_credential(self, user_email: str) -> Optional[Credentials]:
-        """Get credentials from local JSON file."""
+        """Get credentials from local JSON file with file locking."""
         creds_path = self._get_credential_path(user_email)
+        lock_path = creds_path + ".lock"
 
         if not os.path.exists(creds_path):
             logger.debug(f"No credential file found for {user_email} at {creds_path}")
             return None
 
         try:
-            with open(creds_path, "r") as f:
-                creds_data = json.load(f)
+            # Use shared lock for reading to prevent reading during writes
+            with open(lock_path, "w") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
+                try:
+                    with open(creds_path, "r") as f:
+                        creds_data = json.load(f)
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
             # Parse expiry if present
             expiry = None
@@ -162,11 +177,26 @@ class LocalDirectoryCredentialStore(CredentialStore):
             logger.error(
                 f"Error loading credentials for {user_email} from {creds_path}: {e}"
             )
+            # If file is corrupted (partial write from crash), delete it
+            if isinstance(e, json.JSONDecodeError):
+                logger.warning(f"Deleting corrupted credential file for {user_email}")
+                try:
+                    os.remove(creds_path)
+                except OSError:
+                    pass
             return None
+        finally:
+            # Clean up lock file
+            try:
+                if os.path.exists(lock_path):
+                    os.remove(lock_path)
+            except OSError:
+                pass
 
     def store_credential(self, user_email: str, credentials: Credentials) -> bool:
-        """Store credentials to local JSON file."""
+        """Store credentials to local JSON file with atomic writes and file locking."""
         creds_path = self._get_credential_path(user_email)
+        lock_path = creds_path + ".lock"
 
         creds_data = {
             "token": credentials.token,
@@ -179,15 +209,41 @@ class LocalDirectoryCredentialStore(CredentialStore):
         }
 
         try:
-            with open(creds_path, "w") as f:
-                json.dump(creds_data, f, indent=2)
-            logger.info(f"Stored credentials for {user_email} to {creds_path}")
-            return True
+            # Use file locking to prevent race conditions
+            with open(lock_path, "w") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    # Atomic write: write to temp file, then rename
+                    dir_name = os.path.dirname(creds_path)
+                    fd, temp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+                    try:
+                        with os.fdopen(fd, "w") as f:
+                            json.dump(creds_data, f, indent=2)
+                        # Set restrictive permissions before rename
+                        os.chmod(temp_path, 0o600)
+                        # Atomic rename
+                        os.rename(temp_path, creds_path)
+                        logger.info(f"Stored credentials for {user_email} to {creds_path}")
+                        return True
+                    except Exception:
+                        # Clean up temp file on failure
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                        raise
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         except IOError as e:
             logger.error(
                 f"Error storing credentials for {user_email} to {creds_path}: {e}"
             )
             return False
+        finally:
+            # Clean up lock file
+            try:
+                if os.path.exists(lock_path):
+                    os.remove(lock_path)
+            except OSError:
+                pass
 
     def delete_credential(self, user_email: str) -> bool:
         """Delete credential file for a user."""

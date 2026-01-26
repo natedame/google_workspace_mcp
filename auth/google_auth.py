@@ -618,9 +618,20 @@ def get_credentials(
     # Check for single-user mode
     if os.getenv("MCP_SINGLE_USER_MODE") == "1":
         logger.info(
-            "[get_credentials] Single-user mode: bypassing session mapping, finding any credentials"
+            "[get_credentials] Single-user mode: bypassing session mapping"
         )
-        credentials = _find_any_credentials(credentials_base_dir)
+        # In single-user mode, if a specific user email is requested, load their credentials directly
+        if user_google_email:
+            logger.info(
+                f"[get_credentials] Single-user mode: loading credentials for requested user {user_google_email}"
+            )
+            store = get_credential_store()
+            credentials = store.get_credential(user_google_email)
+        else:
+            logger.info(
+                "[get_credentials] Single-user mode: no user specified, finding any credentials"
+            )
+            credentials = _find_any_credentials(credentials_base_dir)
         if not credentials:
             logger.info(
                 f"[get_credentials] Single-user mode: No credentials found in {credentials_base_dir}"
@@ -750,6 +761,19 @@ def get_credentials(
             logger.warning(
                 f"[get_credentials] RefreshError - token expired/revoked: {e}. User: '{user_google_email}', Session: '{session_id}'"
             )
+            # Delete stale credentials to force re-authentication
+            # Without this, invalid credentials persist and cause infinite failures
+            if user_google_email and not is_stateless_mode():
+                try:
+                    credential_store = get_credential_store()
+                    credential_store.delete_credential(user_google_email)
+                    logger.info(
+                        f"[get_credentials] Deleted stale credentials for {user_google_email} after RefreshError"
+                    )
+                except Exception as del_e:
+                    logger.error(
+                        f"[get_credentials] Failed to delete stale credentials: {del_e}"
+                    )
             # For RefreshError, we should return None to trigger reauthentication
             return None
         except Exception as e:

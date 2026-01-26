@@ -273,6 +273,46 @@ async def get_authenticated_google_service_oauth21(
         allow_recent_auth=allow_recent_auth,
     )
 
+    # In single-user mode, fall back to disk-based credential store
+    if not credentials:
+        import os
+        if os.getenv("MCP_SINGLE_USER_MODE") == "1":
+            from auth.credential_store import get_credential_store
+            from google.auth.transport.requests import Request
+
+            credential_store = get_credential_store()
+            credentials = credential_store.get_credential(user_google_email)
+
+            if credentials:
+                logger.info(
+                    f"[{tool_name}] Single-user mode: Loaded credentials from disk for {user_google_email}"
+                )
+
+                # Refresh if expired
+                if credentials.expired and credentials.refresh_token:
+                    try:
+                        credentials.refresh(Request())
+                        # Save refreshed credentials back to disk
+                        credential_store.store_credential(user_google_email, credentials)
+                        logger.info(f"[{tool_name}] Refreshed and saved credentials for {user_google_email}")
+                    except Exception as e:
+                        logger.warning(f"[{tool_name}] Failed to refresh credentials: {e}")
+                        credentials = None
+
+                # Also store in session store for future requests in this session
+                if credentials:
+                    store.store_session(
+                        user_email=user_google_email,
+                        access_token=credentials.token,
+                        refresh_token=credentials.refresh_token,
+                        token_uri=credentials.token_uri,
+                        client_id=credentials.client_id,
+                        client_secret=credentials.client_secret,
+                        scopes=list(credentials.scopes) if credentials.scopes else [],
+                        expiry=credentials.expiry,
+                        mcp_session_id=session_id,
+                    )
+
     if not credentials:
         raise GoogleAuthenticationError(
             f"Access denied: Cannot retrieve credentials for {user_google_email}. "
