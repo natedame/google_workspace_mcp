@@ -164,10 +164,11 @@ def extract_session_from_headers(headers: Dict[str, str]) -> Optional[str]:
 
         # If no session found, create a temporary session ID from token hash
         # This allows header-based authentication to work with session context
+        # Use full hash (64 chars) to prevent collisions with multiple concurrent clients
         import hashlib
 
-        token_hash = hashlib.sha256(token.encode()).hexdigest()[:8]
-        return f"bearer_token_{token_hash}"
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        return f"bearer_{token_hash}"
 
     return None
 
@@ -190,7 +191,10 @@ class OAuth21SessionStore:
     """
 
     def __init__(self):
+        # Primary session storage - keyed by composite key (user_email:mcp_session_id) or just user_email
         self._sessions: Dict[str, Dict[str, Any]] = {}
+        # Maps user_email -> set of session keys (for multi-session support)
+        self._user_sessions: Dict[str, set] = {}
         self._mcp_session_mapping: Dict[
             str, str
         ] = {}  # Maps FastMCP session ID -> user email
@@ -309,6 +313,9 @@ class OAuth21SessionStore:
         """
         Store OAuth 2.1 session information.
 
+        Supports multiple sessions per user by using composite keys (user_email:mcp_session_id).
+        This prevents multiple Claude instances from overwriting each other's session data.
+
         Args:
             user_email: User's email address
             access_token: OAuth 2.1 access token
@@ -335,12 +342,19 @@ class OAuth21SessionStore:
                 "session_id": session_id,
                 "mcp_session_id": mcp_session_id,
                 "issuer": issuer,
+                "user_email": user_email,  # Store for reference
             }
 
-            self._sessions[user_email] = session_info
+            # Initialize user_sessions set if needed
+            if user_email not in self._user_sessions:
+                self._user_sessions[user_email] = set()
 
-            # Store MCP session mapping if provided
+            # Use composite key for MCP session-specific storage
             if mcp_session_id:
+                composite_key = f"{user_email}:{mcp_session_id}"
+                self._sessions[composite_key] = session_info
+                self._user_sessions[user_email].add(composite_key)
+
                 # Create immutable session binding (first binding wins, cannot be changed)
                 if mcp_session_id not in self._session_auth_binding:
                     self._session_auth_binding[mcp_session_id] = user_email
@@ -358,9 +372,15 @@ class OAuth21SessionStore:
 
                 self._mcp_session_mapping[mcp_session_id] = user_email
                 logger.info(
-                    f"Stored OAuth 2.1 session for {user_email} (session_id: {session_id}, mcp_session_id: {mcp_session_id})"
+                    f"Stored OAuth 2.1 session for {user_email} with composite key (mcp_session_id: {mcp_session_id})"
                 )
-            else:
+
+            # Always store under user_email key for backward compatibility and general lookups
+            # This allows get_credentials(user_email) to work without knowing the MCP session
+            self._sessions[user_email] = session_info
+            self._user_sessions[user_email].add(user_email)
+
+            if not mcp_session_id:
                 logger.info(
                     f"Stored OAuth 2.1 session for {user_email} (session_id: {session_id})"
                 )
@@ -369,18 +389,40 @@ class OAuth21SessionStore:
             if session_id and session_id not in self._session_auth_binding:
                 self._session_auth_binding[session_id] = user_email
 
-    def get_credentials(self, user_email: str) -> Optional[Credentials]:
+    def get_credentials(
+        self, user_email: str, mcp_session_id: Optional[str] = None
+    ) -> Optional[Credentials]:
         """
         Get Google credentials for a user from OAuth 2.1 session.
 
+        Supports per-MCP-session isolation by trying the composite key first,
+        then falling back to the user_email key.
+
         Args:
             user_email: User's email address
+            mcp_session_id: Optional MCP session ID for session-specific lookup
 
         Returns:
             Google Credentials object or None
         """
         with self._lock:
-            session_info = self._sessions.get(user_email)
+            session_info = None
+
+            # Try composite key first if mcp_session_id is provided
+            if mcp_session_id:
+                composite_key = f"{user_email}:{mcp_session_id}"
+                session_info = self._sessions.get(composite_key)
+                if session_info:
+                    logger.debug(
+                        f"Found session for {user_email} using composite key (mcp_session: {mcp_session_id})"
+                    )
+
+            # Fall back to user_email key
+            if not session_info:
+                session_info = self._sessions.get(user_email)
+                if session_info:
+                    logger.debug(f"Found session for {user_email} using email key")
+
             if not session_info:
                 logger.debug(f"No OAuth 2.1 session found for {user_email}")
                 return None
@@ -410,6 +452,8 @@ class OAuth21SessionStore:
         """
         Get Google credentials using FastMCP session ID.
 
+        Uses per-session isolation to get the specific session's credentials.
+
         Args:
             mcp_session_id: FastMCP session ID
 
@@ -424,7 +468,8 @@ class OAuth21SessionStore:
                 return None
 
             logger.debug(f"Found user {user_email} for MCP session {mcp_session_id}")
-            return self.get_credentials(user_email)
+            # Use the session-specific lookup with composite key
+            return self.get_credentials(user_email, mcp_session_id)
 
     def get_credentials_with_validation(
         self,
@@ -540,34 +585,72 @@ class OAuth21SessionStore:
         with self._lock:
             return self._sessions.get(user_email)
 
-    def remove_session(self, user_email: str):
-        """Remove session for a user."""
+    def remove_session(self, user_email: str, mcp_session_id: Optional[str] = None):
+        """
+        Remove session for a user.
+
+        Args:
+            user_email: User's email address
+            mcp_session_id: Optional specific MCP session to remove. If None, removes all sessions for user.
+        """
         with self._lock:
-            if user_email in self._sessions:
-                # Get session IDs to clean up mappings
-                session_info = self._sessions.get(user_email, {})
-                mcp_session_id = session_info.get("mcp_session_id")
-                session_id = session_info.get("session_id")
+            if mcp_session_id:
+                # Remove specific session only
+                composite_key = f"{user_email}:{mcp_session_id}"
+                if composite_key in self._sessions:
+                    session_info = self._sessions.get(composite_key, {})
+                    session_id = session_info.get("session_id")
 
-                # Remove from sessions
-                del self._sessions[user_email]
+                    del self._sessions[composite_key]
 
-                # Remove from MCP mapping if exists
-                if mcp_session_id and mcp_session_id in self._mcp_session_mapping:
-                    del self._mcp_session_mapping[mcp_session_id]
-                    # Also remove from auth binding
+                    # Clean up user_sessions tracking
+                    if user_email in self._user_sessions:
+                        self._user_sessions[user_email].discard(composite_key)
+
+                    # Clean up MCP mapping
+                    if mcp_session_id in self._mcp_session_mapping:
+                        del self._mcp_session_mapping[mcp_session_id]
                     if mcp_session_id in self._session_auth_binding:
                         del self._session_auth_binding[mcp_session_id]
+
+                    # Clean up OAuth session binding
+                    if session_id and session_id in self._session_auth_binding:
+                        del self._session_auth_binding[session_id]
+
                     logger.info(
-                        f"Removed OAuth 2.1 session for {user_email} and MCP mapping for {mcp_session_id}"
+                        f"Removed OAuth 2.1 session for {user_email} (mcp_session: {mcp_session_id})"
                     )
+            else:
+                # Remove all sessions for user
+                session_keys = self._user_sessions.get(user_email, set()).copy()
 
-                # Remove OAuth session binding if exists
-                if session_id and session_id in self._session_auth_binding:
-                    del self._session_auth_binding[session_id]
+                for session_key in session_keys:
+                    if session_key in self._sessions:
+                        session_info = self._sessions.get(session_key, {})
+                        mcp_sid = session_info.get("mcp_session_id")
+                        session_id = session_info.get("session_id")
 
-                if not mcp_session_id:
-                    logger.info(f"Removed OAuth 2.1 session for {user_email}")
+                        del self._sessions[session_key]
+
+                        # Clean up MCP mapping
+                        if mcp_sid and mcp_sid in self._mcp_session_mapping:
+                            del self._mcp_session_mapping[mcp_sid]
+                        if mcp_sid and mcp_sid in self._session_auth_binding:
+                            del self._session_auth_binding[mcp_sid]
+
+                        # Clean up OAuth session binding
+                        if session_id and session_id in self._session_auth_binding:
+                            del self._session_auth_binding[session_id]
+
+                # Also remove the plain user_email key if present
+                if user_email in self._sessions:
+                    del self._sessions[user_email]
+
+                # Clean up user_sessions tracking
+                if user_email in self._user_sessions:
+                    del self._user_sessions[user_email]
+
+                logger.info(f"Removed all OAuth 2.1 sessions for {user_email}")
 
     def has_session(self, user_email: str) -> bool:
         """Check if a user has an active session."""
@@ -580,10 +663,11 @@ class OAuth21SessionStore:
             return mcp_session_id in self._mcp_session_mapping
 
     def get_single_user_email(self) -> Optional[str]:
-        """Return the sole authenticated user email when exactly one session exists."""
+        """Return the sole authenticated user email when exactly one user has sessions."""
         with self._lock:
-            if len(self._sessions) == 1:
-                return next(iter(self._sessions))
+            # Use _user_sessions to count unique users, not session keys
+            if len(self._user_sessions) == 1:
+                return next(iter(self._user_sessions))
             return None
 
     def get_stats(self) -> Dict[str, Any]:
@@ -591,7 +675,9 @@ class OAuth21SessionStore:
         with self._lock:
             return {
                 "total_sessions": len(self._sessions),
-                "users": list(self._sessions.keys()),
+                "unique_users": len(self._user_sessions),
+                "users": list(self._user_sessions.keys()),
+                "session_keys": list(self._sessions.keys()),
                 "mcp_session_mappings": len(self._mcp_session_mapping),
                 "mcp_sessions": list(self._mcp_session_mapping.keys()),
             }
@@ -746,10 +832,23 @@ def ensure_session_from_access_token(
     if email:
         try:
             store = get_oauth21_session_store()
+
+            # CRITICAL: Preserve existing refresh_token if new credentials don't have one
+            # This prevents overwriting a valid refresh_token with None when processing
+            # bearer tokens that don't include the refresh_token
+            refresh_token_to_store = credentials.refresh_token
+            if not refresh_token_to_store:
+                existing_session = store.get_session_info(email)
+                if existing_session and existing_session.get("refresh_token"):
+                    refresh_token_to_store = existing_session["refresh_token"]
+                    logger.debug(
+                        f"Preserving existing refresh_token for {email} (new credentials had None)"
+                    )
+
             store.store_session(
                 user_email=email,
                 access_token=credentials.token,
-                refresh_token=credentials.refresh_token,
+                refresh_token=refresh_token_to_store,
                 token_uri=credentials.token_uri,
                 client_id=credentials.client_id,
                 client_secret=credentials.client_secret,

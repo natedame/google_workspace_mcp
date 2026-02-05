@@ -278,7 +278,6 @@ async def get_authenticated_google_service_oauth21(
         import os
         if os.getenv("MCP_SINGLE_USER_MODE") == "1":
             from auth.credential_store import get_credential_store
-            from google.auth.transport.requests import Request
 
             credential_store = get_credential_store()
             credentials = credential_store.get_credential(user_google_email)
@@ -288,15 +287,21 @@ async def get_authenticated_google_service_oauth21(
                     f"[{tool_name}] Single-user mode: Loaded credentials from disk for {user_google_email}"
                 )
 
-                # Refresh if expired
+                # Refresh if expired using distributed locking to prevent race conditions
                 if credentials.expired and credentials.refresh_token:
-                    try:
-                        credentials.refresh(Request())
-                        # Save refreshed credentials back to disk
-                        credential_store.store_credential(user_google_email, credentials)
-                        logger.info(f"[{tool_name}] Refreshed and saved credentials for {user_google_email}")
-                    except Exception as e:
-                        logger.warning(f"[{tool_name}] Failed to refresh credentials: {e}")
+                    logger.info(
+                        f"[{tool_name}] Credentials expired, using distributed lock for refresh"
+                    )
+                    refreshed_credentials, we_did_refresh = credential_store.refresh_credential_with_lock(
+                        user_google_email
+                    )
+                    if refreshed_credentials:
+                        credentials = refreshed_credentials
+                        logger.info(
+                            f"[{tool_name}] Refreshed credentials (by_us={we_did_refresh}) for {user_google_email}"
+                        )
+                    else:
+                        logger.warning(f"[{tool_name}] Failed to refresh credentials for {user_google_email}")
                         credentials = None
 
                 # Also store in session store for future requests in this session

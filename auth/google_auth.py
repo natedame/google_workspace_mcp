@@ -717,71 +717,88 @@ def get_credentials(
         return credentials
     elif credentials.expired and credentials.refresh_token:
         logger.info(
-            f"[get_credentials] Credentials expired. Attempting refresh. User: '{user_google_email}', Session: '{session_id}'"
+            f"[get_credentials] Credentials expired. Attempting refresh with distributed lock. User: '{user_google_email}', Session: '{session_id}'"
         )
-        try:
-            logger.debug(
-                "[get_credentials] Refreshing token using embedded client credentials"
-            )
-            # client_config = load_client_secrets(client_secrets_path) # Not strictly needed if creds have client_id/secret
-            credentials.refresh(Request())
-            logger.info(
-                f"[get_credentials] Credentials refreshed successfully. User: '{user_google_email}', Session: '{session_id}'"
+
+        # Use distributed locking to prevent race conditions when multiple
+        # processes try to refresh the same token simultaneously
+        if user_google_email and not is_stateless_mode():
+            credential_store = get_credential_store()
+            refreshed_credentials, we_did_refresh = credential_store.refresh_credential_with_lock(
+                user_google_email
             )
 
-            # Save refreshed credentials (skip file save in stateless mode)
-            if user_google_email:  # Always save to credential store if email is known
-                if not is_stateless_mode():
-                    credential_store = get_credential_store()
-                    credential_store.store_credential(user_google_email, credentials)
-                else:
-                    logger.info(
-                        f"Skipping credential file save in stateless mode for {user_google_email}"
-                    )
+            if refreshed_credentials:
+                logger.info(
+                    f"[get_credentials] Credentials refreshed successfully (by_us={we_did_refresh}). User: '{user_google_email}', Session: '{session_id}'"
+                )
 
-                # Also update OAuth21SessionStore
+                # Update OAuth21SessionStore with refreshed credentials
                 store = get_oauth21_session_store()
                 store.store_session(
                     user_email=user_google_email,
-                    access_token=credentials.token,
-                    refresh_token=credentials.refresh_token,
-                    token_uri=credentials.token_uri,
-                    client_id=credentials.client_id,
-                    client_secret=credentials.client_secret,
-                    scopes=credentials.scopes,
-                    expiry=credentials.expiry,
+                    access_token=refreshed_credentials.token,
+                    refresh_token=refreshed_credentials.refresh_token,
+                    token_uri=refreshed_credentials.token_uri,
+                    client_id=refreshed_credentials.client_id,
+                    client_secret=refreshed_credentials.client_secret,
+                    scopes=refreshed_credentials.scopes,
+                    expiry=refreshed_credentials.expiry,
                     mcp_session_id=session_id,
-                    issuer="https://accounts.google.com",  # Add issuer for Google tokens
+                    issuer="https://accounts.google.com",
                 )
 
-            if session_id:  # Update session cache if it was the source or is active
-                save_credentials_to_session(session_id, credentials)
-            return credentials
-        except RefreshError as e:
-            logger.warning(
-                f"[get_credentials] RefreshError - token expired/revoked: {e}. User: '{user_google_email}', Session: '{session_id}'"
-            )
-            # Delete stale credentials to force re-authentication
-            # Without this, invalid credentials persist and cause infinite failures
-            if user_google_email and not is_stateless_mode():
-                try:
-                    credential_store = get_credential_store()
-                    credential_store.delete_credential(user_google_email)
-                    logger.info(
-                        f"[get_credentials] Deleted stale credentials for {user_google_email} after RefreshError"
+                # Update session cache if active
+                if session_id:
+                    save_credentials_to_session(session_id, refreshed_credentials)
+
+                return refreshed_credentials
+            else:
+                logger.warning(
+                    f"[get_credentials] Distributed refresh failed for {user_google_email}"
+                )
+                return None
+        else:
+            # Stateless mode or no user email - do inline refresh (no file locking needed)
+            try:
+                logger.debug(
+                    "[get_credentials] Refreshing token inline (stateless mode or no user email)"
+                )
+                credentials.refresh(Request())
+                logger.info(
+                    f"[get_credentials] Credentials refreshed successfully. User: '{user_google_email}', Session: '{session_id}'"
+                )
+
+                # Update OAuth21SessionStore
+                if user_google_email:
+                    store = get_oauth21_session_store()
+                    store.store_session(
+                        user_email=user_google_email,
+                        access_token=credentials.token,
+                        refresh_token=credentials.refresh_token,
+                        token_uri=credentials.token_uri,
+                        client_id=credentials.client_id,
+                        client_secret=credentials.client_secret,
+                        scopes=credentials.scopes,
+                        expiry=credentials.expiry,
+                        mcp_session_id=session_id,
+                        issuer="https://accounts.google.com",
                     )
-                except Exception as del_e:
-                    logger.error(
-                        f"[get_credentials] Failed to delete stale credentials: {del_e}"
-                    )
-            # For RefreshError, we should return None to trigger reauthentication
-            return None
-        except Exception as e:
-            logger.error(
-                f"[get_credentials] Error refreshing credentials: {e}. User: '{user_google_email}', Session: '{session_id}'",
-                exc_info=True,
-            )
-            return None  # Failed to refresh
+
+                if session_id:
+                    save_credentials_to_session(session_id, credentials)
+                return credentials
+            except RefreshError as e:
+                logger.warning(
+                    f"[get_credentials] RefreshError - token expired/revoked: {e}. User: '{user_google_email}', Session: '{session_id}'"
+                )
+                return None
+            except Exception as e:
+                logger.error(
+                    f"[get_credentials] Error refreshing credentials: {e}. User: '{user_google_email}', Session: '{session_id}'",
+                    exc_info=True,
+                )
+                return None
     else:
         logger.warning(
             f"[get_credentials] Credentials invalid/cannot refresh. Valid: {credentials.valid}, Refresh Token: {credentials.refresh_token is not None}. User: '{user_google_email}', Session: '{session_id}'"

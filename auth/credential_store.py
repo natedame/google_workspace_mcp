@@ -10,10 +10,13 @@ import json
 import logging
 import tempfile
 import fcntl
+import time
 from abc import ABC, abstractmethod
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from datetime import datetime
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,27 @@ class CredentialStore(ABC):
 
         Returns:
             List of user email addresses
+        """
+        pass
+
+    @abstractmethod
+    def refresh_credential_with_lock(
+        self, user_email: str, timeout: float = 30.0
+    ) -> Tuple[Optional[Credentials], bool]:
+        """
+        Refresh credentials with distributed locking to prevent race conditions.
+
+        Uses locking to ensure only one process refreshes at a time.
+        Other processes wait and then read the refreshed credentials.
+
+        Args:
+            user_email: User's email address
+            timeout: Maximum time to wait for lock (seconds)
+
+        Returns:
+            Tuple of (Credentials or None, was_refreshed_by_us: bool)
+            - Credentials: The refreshed credentials, or None if refresh failed
+            - was_refreshed_by_us: True if we did the refresh, False if another process did
         """
         pass
 
@@ -283,6 +307,151 @@ class LocalDirectoryCredentialStore(CredentialStore):
             logger.error(f"Error listing credential files in {self.base_dir}: {e}")
 
         return sorted(users)
+
+    def refresh_credential_with_lock(
+        self, user_email: str, timeout: float = 30.0
+    ) -> Tuple[Optional[Credentials], bool]:
+        """
+        Refresh credentials with distributed locking to prevent race conditions.
+
+        Uses a separate refresh lock file to ensure only one process refreshes at a time.
+        Other processes wait and then read the refreshed credentials.
+
+        Args:
+            user_email: User's email address
+            timeout: Maximum time to wait for lock (seconds)
+
+        Returns:
+            Tuple of (Credentials or None, was_refreshed_by_us: bool)
+        """
+        creds_path = self._get_credential_path(user_email)
+        refresh_lock_path = creds_path + ".refresh_lock"
+        refresh_lock_fd = None
+        we_did_refresh = False
+
+        try:
+            # Create/open the refresh lock file
+            refresh_lock_fd = os.open(
+                refresh_lock_path, os.O_CREAT | os.O_RDWR, 0o600
+            )
+
+            # Try non-blocking lock first
+            try:
+                fcntl.flock(refresh_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                logger.debug(f"Acquired refresh lock for {user_email}")
+            except BlockingIOError:
+                # Another process is refreshing - wait for it with timeout
+                logger.info(
+                    f"Another process is refreshing credentials for {user_email}, waiting up to {timeout}s..."
+                )
+                start_time = time.time()
+
+                # Poll with timeout since fcntl doesn't support timeout directly
+                while True:
+                    try:
+                        fcntl.flock(refresh_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break  # Got the lock
+                    except BlockingIOError:
+                        if time.time() - start_time > timeout:
+                            logger.error(
+                                f"Timeout waiting for refresh lock for {user_email}"
+                            )
+                            os.close(refresh_lock_fd)
+                            return None, False
+                        time.sleep(0.1)  # Brief sleep before retry
+
+                # After acquiring lock, check if credentials are now valid
+                # (another process likely refreshed them)
+                credentials = self.get_credential(user_email)
+                if credentials and credentials.valid:
+                    logger.info(
+                        f"Credentials were refreshed by another process for {user_email}"
+                    )
+                    fcntl.flock(refresh_lock_fd, fcntl.LOCK_UN)
+                    os.close(refresh_lock_fd)
+                    self._cleanup_refresh_lock(refresh_lock_path)
+                    return credentials, False
+
+            # We hold the refresh lock - check current credential state
+            credentials = self.get_credential(user_email)
+            if not credentials:
+                logger.warning(f"No credentials found for {user_email} during refresh")
+                fcntl.flock(refresh_lock_fd, fcntl.LOCK_UN)
+                os.close(refresh_lock_fd)
+                self._cleanup_refresh_lock(refresh_lock_path)
+                return None, False
+
+            # Check if already valid (edge case: became valid while we acquired lock)
+            if credentials.valid:
+                logger.debug(f"Credentials already valid for {user_email}")
+                fcntl.flock(refresh_lock_fd, fcntl.LOCK_UN)
+                os.close(refresh_lock_fd)
+                self._cleanup_refresh_lock(refresh_lock_path)
+                return credentials, False
+
+            # Check if we can refresh
+            if not credentials.expired or not credentials.refresh_token:
+                logger.warning(
+                    f"Cannot refresh credentials for {user_email}: "
+                    f"expired={credentials.expired}, has_refresh_token={credentials.refresh_token is not None}"
+                )
+                fcntl.flock(refresh_lock_fd, fcntl.LOCK_UN)
+                os.close(refresh_lock_fd)
+                self._cleanup_refresh_lock(refresh_lock_path)
+                return None, False
+
+            # Perform the refresh
+            try:
+                logger.info(f"Refreshing credentials for {user_email}")
+                credentials.refresh(Request())
+                we_did_refresh = True
+
+                # Save the refreshed credentials
+                if self.store_credential(user_email, credentials):
+                    logger.info(
+                        f"Successfully refreshed and saved credentials for {user_email}"
+                    )
+                else:
+                    logger.error(
+                        f"Refreshed credentials but failed to save for {user_email}"
+                    )
+
+            except RefreshError as e:
+                logger.error(f"RefreshError for {user_email}: {e}")
+                # Delete stale credentials to force re-authentication
+                self.delete_credential(user_email)
+                credentials = None
+
+            except Exception as e:
+                logger.error(f"Unexpected error refreshing credentials for {user_email}: {e}")
+                credentials = None
+
+            # Release lock
+            fcntl.flock(refresh_lock_fd, fcntl.LOCK_UN)
+            os.close(refresh_lock_fd)
+            refresh_lock_fd = None
+            self._cleanup_refresh_lock(refresh_lock_path)
+
+            return credentials, we_did_refresh
+
+        except Exception as e:
+            logger.error(f"Error in refresh_credential_with_lock for {user_email}: {e}")
+            if refresh_lock_fd is not None:
+                try:
+                    fcntl.flock(refresh_lock_fd, fcntl.LOCK_UN)
+                    os.close(refresh_lock_fd)
+                except Exception:
+                    pass
+            self._cleanup_refresh_lock(refresh_lock_path)
+            return None, False
+
+    def _cleanup_refresh_lock(self, lock_path: str) -> None:
+        """Clean up refresh lock file."""
+        try:
+            if os.path.exists(lock_path):
+                os.unlink(lock_path)
+        except OSError:
+            pass  # Best effort cleanup
 
 
 # Global credential store instance
