@@ -46,6 +46,7 @@ def build_text_style(
     font_family: str = None,
     text_color: str = None,
     background_color: str = None,
+    link_url: str = None,
 ) -> tuple[Dict[str, Any], list[str]]:
     """
     Build text style object for Google Docs API requests.
@@ -58,6 +59,7 @@ def build_text_style(
         font_family: Font family name
         text_color: Text color as hex string "#RRGGBB"
         background_color: Background (highlight) color as hex string "#RRGGBB"
+        link_url: URL to create a hyperlink
 
     Returns:
         Tuple of (text_style_dict, list_of_field_names)
@@ -94,6 +96,10 @@ def build_text_style(
         rgb = _normalize_color(background_color, "background_color")
         text_style["backgroundColor"] = {"color": {"rgbColor": rgb}}
         fields.append("backgroundColor")
+
+    if link_url is not None:
+        text_style["link"] = {"url": link_url}
+        fields.append("link")
 
     return text_style, fields
 
@@ -162,6 +168,7 @@ def create_format_text_request(
     font_family: str = None,
     text_color: str = None,
     background_color: str = None,
+    link_url: str = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Create an updateTextStyle request for Google Docs API.
@@ -176,12 +183,13 @@ def create_format_text_request(
         font_family: Font family name
         text_color: Text color as hex string "#RRGGBB"
         background_color: Background (highlight) color as hex string "#RRGGBB"
+        link_url: URL to create a hyperlink
 
     Returns:
         Dictionary representing the updateTextStyle request, or None if no styles provided
     """
     text_style, fields = build_text_style(
-        bold, italic, underline, font_size, font_family, text_color, background_color
+        bold, italic, underline, font_size, font_family, text_color, background_color, link_url
     )
 
     if not text_style:
@@ -192,6 +200,28 @@ def create_format_text_request(
             "range": {"startIndex": start_index, "endIndex": end_index},
             "textStyle": text_style,
             "fields": ",".join(fields),
+        }
+    }
+
+
+def create_paragraph_bullets_request(
+    start_index: int, end_index: int, bullet_preset: str = "BULLET_DISC_CIRCLE_SQUARE"
+) -> Dict[str, Any]:
+    """
+    Create a createParagraphBullets request for Google Docs API.
+
+    Args:
+        start_index: Start position of paragraphs to convert to bullets
+        end_index: End position of paragraphs to convert to bullets
+        bullet_preset: Bullet style preset (e.g., BULLET_DISC_CIRCLE_SQUARE)
+
+    Returns:
+        Dictionary representing the createParagraphBullets request
+    """
+    return {
+        "createParagraphBullets": {
+            "range": {"startIndex": start_index, "endIndex": end_index},
+            "bulletPreset": bullet_preset,
         }
     }
 
@@ -329,6 +359,7 @@ def validate_operation(operation: Dict[str, Any]) -> tuple[bool, str]:
         "insert_table": ["index", "rows", "columns"],
         "insert_page_break": ["index"],
         "find_replace": ["find_text", "replace_text"],
+        "create_paragraph_bullets": ["start_index", "end_index"],
     }
 
     if op_type not in required_fields:

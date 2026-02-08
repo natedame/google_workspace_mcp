@@ -157,6 +157,7 @@ class ValidationManager:
         font_family: Optional[str] = None,
         text_color: Optional[str] = None,
         background_color: Optional[str] = None,
+        link_url: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
         Validate text formatting parameters.
@@ -169,6 +170,7 @@ class ValidationManager:
             font_family: Font family name
             text_color: Text color in "#RRGGBB" format
             background_color: Background color in "#RRGGBB" format
+            link_url: URL to create a hyperlink
 
         Returns:
             Tuple of (is_valid, error_message)
@@ -182,11 +184,12 @@ class ValidationManager:
             font_family,
             text_color,
             background_color,
+            link_url,
         ]
         if all(param is None for param in formatting_params):
             return (
                 False,
-                "At least one formatting parameter must be provided (bold, italic, underline, font_size, font_family, text_color, or background_color)",
+                "At least one formatting parameter must be provided (bold, italic, underline, font_size, font_family, text_color, background_color, or link_url)",
             )
 
         # Validate boolean parameters
@@ -479,6 +482,7 @@ class ValidationManager:
                     op.get("font_family"),
                     op.get("text_color"),
                     op.get("background_color"),
+                    op.get("link_url"),
                 )
                 if not is_valid:
                     return False, f"Operation {i + 1} (format_text): {error_msg}"

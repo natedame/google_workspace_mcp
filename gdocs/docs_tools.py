@@ -367,6 +367,7 @@ async def modify_doc_text(
     font_family: str = None,
     text_color: str = None,
     background_color: str = None,
+    link_url: str = None,
 ) -> str:
     """
     Modifies text in a Google Doc - can insert/replace text and/or apply formatting in a single operation.
@@ -384,13 +385,14 @@ async def modify_doc_text(
         font_family: Font family name (e.g., "Arial", "Times New Roman")
         text_color: Foreground text color (#RRGGBB)
         background_color: Background/highlight color (#RRGGBB)
+        link_url: URL to create a hyperlink on the text
 
     Returns:
         str: Confirmation message with operation details
     """
     logger.info(
         f"[modify_doc_text] Doc={document_id}, start={start_index}, end={end_index}, text={text is not None}, "
-        f"formatting={any([bold, italic, underline, font_size, font_family, text_color, background_color])}"
+        f"formatting={any([bold, italic, underline, font_size, font_family, text_color, background_color, link_url])}"
     )
 
     # Input validation
@@ -401,7 +403,7 @@ async def modify_doc_text(
         return f"Error: {error_msg}"
 
     # Validate that we have something to do
-    if text is None and not any(
+    has_formatting = any(
         [
             bold is not None,
             italic is not None,
@@ -410,22 +412,14 @@ async def modify_doc_text(
             font_family,
             text_color,
             background_color,
+            link_url,
         ]
-    ):
-        return "Error: Must provide either 'text' to insert/replace, or formatting parameters (bold, italic, underline, font_size, font_family, text_color, background_color)."
+    )
+    if text is None and not has_formatting:
+        return "Error: Must provide either 'text' to insert/replace, or formatting parameters (bold, italic, underline, font_size, font_family, text_color, background_color, link_url)."
 
     # Validate text formatting params if provided
-    if any(
-        [
-            bold is not None,
-            italic is not None,
-            underline is not None,
-            font_size,
-            font_family,
-            text_color,
-            background_color,
-        ]
-    ):
+    if has_formatting:
         is_valid, error_msg = validator.validate_text_formatting_params(
             bold,
             italic,
@@ -434,6 +428,7 @@ async def modify_doc_text(
             font_family,
             text_color,
             background_color,
+            link_url,
         )
         if not is_valid:
             return f"Error: {error_msg}"
@@ -482,17 +477,7 @@ async def modify_doc_text(
             operations.append(f"Inserted text at index {start_index}")
 
     # Handle formatting
-    if any(
-        [
-            bold is not None,
-            italic is not None,
-            underline is not None,
-            font_size,
-            font_family,
-            text_color,
-            background_color,
-        ]
-    ):
+    if has_formatting:
         # Adjust range for formatting based on text operations
         format_start = start_index
         format_end = end_index
@@ -524,6 +509,7 @@ async def modify_doc_text(
                 font_family,
                 text_color,
                 background_color,
+                link_url,
             )
         )
 
@@ -542,6 +528,8 @@ async def modify_doc_text(
             format_details.append(f"text_color={text_color}")
         if background_color:
             format_details.append(f"background_color={background_color}")
+        if link_url:
+            format_details.append(f"link_url={link_url}")
 
         operations.append(
             f"Applied formatting ({', '.join(format_details)}) to range {format_start}-{format_end}"

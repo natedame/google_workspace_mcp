@@ -16,6 +16,7 @@ from gdocs.docs_helpers import (
     create_find_replace_request,
     create_insert_table_request,
     create_insert_page_break_request,
+    create_paragraph_bullets_request,
     validate_operation,
 )
 
@@ -189,6 +190,7 @@ class BatchOperationManager:
                 op.get("font_family"),
                 op.get("text_color"),
                 op.get("background_color"),
+                op.get("link_url"),
             )
 
             if not request:
@@ -204,6 +206,7 @@ class BatchOperationManager:
                 ("font_family", "font family"),
                 ("text_color", "text color"),
                 ("background_color", "background color"),
+                ("link_url", "link"),
             ]:
                 if op.get(param) is not None:
                     value = f"{op[param]}pt" if param == "font_size" else op[param]
@@ -227,6 +230,13 @@ class BatchOperationManager:
             )
             description = f"find/replace '{op['find_text']}' → '{op['replace_text']}'"
 
+        elif op_type == "create_paragraph_bullets":
+            bullet_preset = op.get("bullet_preset", "BULLET_DISC_CIRCLE_SQUARE")
+            request = create_paragraph_bullets_request(
+                op["start_index"], op["end_index"], bullet_preset
+            )
+            description = f"create bullets {op['start_index']}-{op['end_index']} ({bullet_preset})"
+
         else:
             supported_types = [
                 "insert_text",
@@ -236,6 +246,7 @@ class BatchOperationManager:
                 "insert_table",
                 "insert_page_break",
                 "find_replace",
+                "create_paragraph_bullets",
             ]
             raise ValueError(
                 f"Unsupported operation type '{op_type}'. Supported: {', '.join(supported_types)}"
@@ -315,6 +326,7 @@ class BatchOperationManager:
                         "font_family",
                         "text_color",
                         "background_color",
+                        "link_url",
                     ],
                     "description": "Apply formatting to text range",
                 },
@@ -330,6 +342,11 @@ class BatchOperationManager:
                     "required": ["find_text", "replace_text"],
                     "optional": ["match_case"],
                     "description": "Find and replace text throughout document",
+                },
+                "create_paragraph_bullets": {
+                    "required": ["start_index", "end_index"],
+                    "optional": ["bullet_preset"],
+                    "description": "Convert paragraphs in range to bullet list",
                 },
             },
             "example_operations": [
