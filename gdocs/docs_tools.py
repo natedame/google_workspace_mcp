@@ -164,6 +164,8 @@ async def get_doc_content(
             for element in elements:
                 if "paragraph" in element:
                     paragraph = element.get("paragraph", {})
+                    para_style = paragraph.get("paragraphStyle", {})
+                    named_style = para_style.get("namedStyleType", "")
                     para_elements = paragraph.get("elements", [])
                     current_line_text = ""
                     for pe in para_elements:
@@ -171,7 +173,10 @@ async def get_doc_content(
                         if text_run and "content" in text_run:
                             current_line_text += text_run["content"]
                     if current_line_text.strip():
-                        text_lines.append(current_line_text)
+                        if named_style and named_style != "NORMAL_TEXT":
+                            text_lines.append(f"[{named_style}] {current_line_text}")
+                        else:
+                            text_lines.append(current_line_text)
                 elif "table" in element:
                     # Handle table content
                     table = element.get("table", {})
