@@ -226,6 +226,29 @@ def create_paragraph_bullets_request(
     }
 
 
+def create_update_paragraph_style_request(
+    start_index: int, end_index: int, named_style_type: str
+) -> Dict[str, Any]:
+    """
+    Create an updateParagraphStyle request for Google Docs API.
+
+    Args:
+        start_index: Start position of the paragraph(s) to style
+        end_index: End position of the paragraph(s) to style
+        named_style_type: Named style type (e.g., TITLE, HEADING_1, HEADING_2, HEADING_3, NORMAL_TEXT)
+
+    Returns:
+        Dictionary representing the updateParagraphStyle request
+    """
+    return {
+        "updateParagraphStyle": {
+            "range": {"startIndex": start_index, "endIndex": end_index},
+            "paragraphStyle": {"namedStyleType": named_style_type},
+            "fields": "namedStyleType",
+        }
+    }
+
+
 def create_find_replace_request(
     find_text: str, replace_text: str, match_case: bool = False
 ) -> Dict[str, Any]:
@@ -360,6 +383,7 @@ def validate_operation(operation: Dict[str, Any]) -> tuple[bool, str]:
         "insert_page_break": ["index"],
         "find_replace": ["find_text", "replace_text"],
         "create_paragraph_bullets": ["start_index", "end_index"],
+        "update_paragraph_style": ["start_index", "end_index", "named_style_type"],
     }
 
     if op_type not in required_fields:

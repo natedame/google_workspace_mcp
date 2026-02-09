@@ -17,6 +17,7 @@ from gdocs.docs_helpers import (
     create_insert_table_request,
     create_insert_page_break_request,
     create_paragraph_bullets_request,
+    create_update_paragraph_style_request,
     validate_operation,
 )
 
@@ -237,6 +238,12 @@ class BatchOperationManager:
             )
             description = f"create bullets {op['start_index']}-{op['end_index']} ({bullet_preset})"
 
+        elif op_type == "update_paragraph_style":
+            request = create_update_paragraph_style_request(
+                op["start_index"], op["end_index"], op["named_style_type"]
+            )
+            description = f"update paragraph style {op['start_index']}-{op['end_index']} ({op['named_style_type']})"
+
         else:
             supported_types = [
                 "insert_text",
@@ -247,6 +254,7 @@ class BatchOperationManager:
                 "insert_page_break",
                 "find_replace",
                 "create_paragraph_bullets",
+                "update_paragraph_style",
             ]
             raise ValueError(
                 f"Unsupported operation type '{op_type}'. Supported: {', '.join(supported_types)}"

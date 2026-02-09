@@ -841,7 +841,7 @@ async def batch_update_doc(
         user_google_email: User's Google email address
         document_id: ID of the document to update
         operations: List of operation dictionaries. Each operation should contain:
-                   - type: Operation type ('insert_text', 'delete_text', 'replace_text', 'format_text', 'insert_table', 'insert_page_break')
+                   - type: Operation type ('insert_text', 'delete_text', 'replace_text', 'format_text', 'insert_table', 'insert_page_break', 'update_paragraph_style')
                    - Additional parameters specific to each operation type
 
     Example operations:
