@@ -3,6 +3,9 @@ Table Operation Manager
 
 This module provides high-level table operations that orchestrate
 multiple Google Docs API calls for complex table manipulations.
+
+Uses batch operations to minimize API calls and avoid rate limiting.
+A table creation + population takes 3 API calls instead of N*M+1.
 """
 
 import logging
@@ -11,19 +14,54 @@ from typing import List, Dict, Any, Tuple
 
 from gdocs.docs_helpers import create_insert_table_request
 from gdocs.docs_structure import find_tables
-from gdocs.docs_tables import validate_table_data
+from gdocs.docs_tables import validate_table_data, build_table_population_requests
 
 logger = logging.getLogger(__name__)
+
+
+def _reverse_cell_groups(requests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Reverse the order of cell groups for correct Google Docs batch execution.
+
+    Each cell group starts with an insertText and may be followed by an
+    updateTextStyle (bold). We reverse the GROUP order so cells are processed
+    from highest index to lowest, but within each group the insertText still
+    comes before the bold formatting.
+
+    This is necessary because Google Docs batchUpdate applies requests
+    sequentially — inserting text shifts all subsequent indices.
+    """
+    groups: List[List[Dict[str, Any]]] = []
+    current_group: List[Dict[str, Any]] = []
+
+    for req in requests:
+        if "insertText" in req:
+            # Start a new group
+            if current_group:
+                groups.append(current_group)
+            current_group = [req]
+        else:
+            # updateTextStyle (bold) belongs to the current group
+            current_group.append(req)
+
+    if current_group:
+        groups.append(current_group)
+
+    # Reverse group order, flatten back
+    groups.reverse()
+    result: List[Dict[str, Any]] = []
+    for group in groups:
+        result.extend(group)
+    return result
 
 
 class TableOperationManager:
     """
     High-level manager for Google Docs table operations.
 
-    Handles complex multi-step table operations including:
-    - Creating tables with data population
-    - Populating existing tables
-    - Managing cell-by-cell operations with proper index refreshing
+    Uses batch operations to minimize API calls:
+    - create_and_populate_table: 3 API calls (create + read structure + batch populate)
+    - populate_existing_table: 2 API calls (read structure + batch populate)
     """
 
     def __init__(self, service):
@@ -43,9 +81,12 @@ class TableOperationManager:
         bold_headers: bool = True,
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
-        Creates a table and populates it with data in a reliable multi-step process.
+        Creates a table and populates it with data using batch operations.
 
-        This method extracts the complex logic from create_table_with_data tool function.
+        Uses 3 API calls total:
+        1. batchUpdate with insertTable (create empty table)
+        2. documents().get() (read structure to get cell indices)
+        3. batchUpdate with all insertText + formatting ops (populate all cells at once)
 
         Args:
             document_id: ID of the document to update
@@ -57,7 +98,8 @@ class TableOperationManager:
             Tuple of (success, message, metadata)
         """
         logger.debug(
-            f"Creating table at index {index}, dimensions: {len(table_data)}x{len(table_data[0]) if table_data and len(table_data) > 0 else 0}"
+            f"Creating table at index {index}, dimensions: "
+            f"{len(table_data)}x{len(table_data[0]) if table_data and len(table_data) > 0 else 0}"
         )
 
         # Validate input data
@@ -69,29 +111,83 @@ class TableOperationManager:
         cols = len(table_data[0])
 
         try:
-            # Step 1: Create empty table
+            # Step 1: Create empty table (1 API call)
             await self._create_empty_table(document_id, index, rows, cols)
 
-            # Step 2: Get fresh document structure to find actual cell positions
+            # Step 2: Get fresh document structure to find actual cell positions (1 API call)
             fresh_tables = await self._get_document_tables(document_id)
             if not fresh_tables:
                 return False, "Could not find table after creation", {}
 
-            # Step 3: Populate each cell with proper index refreshing
-            population_count = await self._populate_table_cells(
-                document_id, table_data, bold_headers
+            # Use the last table (the one we just created)
+            table_info = fresh_tables[-1]
+
+            # Step 3: Build all cell population requests as a batch
+            requests = build_table_population_requests(
+                table_info, table_data, bold_headers
             )
+
+            if not requests:
+                # No cells to populate (all empty strings)
+                metadata = {
+                    "rows": rows,
+                    "columns": cols,
+                    "populated_cells": 0,
+                    "table_index": len(fresh_tables) - 1,
+                }
+                return (
+                    True,
+                    f"Successfully created {rows}x{cols} table (no cell data to populate)",
+                    metadata,
+                )
+
+            # CRITICAL: Reverse CELL GROUP order for correct batch execution.
+            # Google Docs batchUpdate processes requests sequentially — each insertText
+            # shifts indices after it. By processing cells from highest index to lowest,
+            # earlier insertions don't invalidate later cell indices.
+            # BUT within each cell group, insertText must come before updateTextStyle
+            # (bold), so we reverse groups, not individual requests.
+            requests = _reverse_cell_groups(requests)
+
+            # Step 4: Execute all cell insertions in a single batchUpdate (1 API call)
+            result = await asyncio.to_thread(
+                self.service.documents()
+                .batchUpdate(
+                    documentId=document_id,
+                    body={"requests": requests},
+                )
+                .execute
+            )
+
+            replies = result.get("replies", [])
+            # Count successful insertText operations (non-empty replies)
+            populated_cells = sum(
+                1 for r in replies if r  # Non-empty reply = successful operation
+            )
+            # If all replies are empty dicts (normal for successful insertText),
+            # count the insertText requests
+            if populated_cells == 0:
+                populated_cells = sum(
+                    1 for r in requests if "insertText" in r
+                )
 
             metadata = {
                 "rows": rows,
                 "columns": cols,
-                "populated_cells": population_count,
+                "populated_cells": populated_cells,
                 "table_index": len(fresh_tables) - 1,
+                "api_calls": 3,
+                "batch_requests": len(requests),
             }
+
+            logger.info(
+                f"Table {rows}x{cols} created and populated with {populated_cells} cells "
+                f"using 3 API calls (batch of {len(requests)} operations)"
+            )
 
             return (
                 True,
-                f"Successfully created {rows}x{cols} table and populated {population_count} cells",
+                f"Successfully created {rows}x{cols} table and populated {populated_cells} cells",
                 metadata,
             )
 
@@ -121,138 +217,6 @@ class TableOperationManager:
         )
         return find_tables(doc)
 
-    async def _populate_table_cells(
-        self, document_id: str, table_data: List[List[str]], bold_headers: bool
-    ) -> int:
-        """
-        Populate table cells with data, refreshing structure after each insertion.
-
-        This prevents index shifting issues by getting fresh cell positions
-        before each insertion.
-        """
-        population_count = 0
-
-        for row_idx, row_data in enumerate(table_data):
-            logger.debug(f"Processing row {row_idx}: {len(row_data)} cells")
-
-            for col_idx, cell_text in enumerate(row_data):
-                if not cell_text:  # Skip empty cells
-                    continue
-
-                try:
-                    # CRITICAL: Refresh document structure before each insertion
-                    success = await self._populate_single_cell(
-                        document_id,
-                        row_idx,
-                        col_idx,
-                        cell_text,
-                        bold_headers and row_idx == 0,
-                    )
-
-                    if success:
-                        population_count += 1
-                        logger.debug(f"Populated cell ({row_idx},{col_idx})")
-                    else:
-                        logger.warning(f"Failed to populate cell ({row_idx},{col_idx})")
-
-                except Exception as e:
-                    logger.error(
-                        f"Error populating cell ({row_idx},{col_idx}): {str(e)}"
-                    )
-
-        return population_count
-
-    async def _populate_single_cell(
-        self,
-        document_id: str,
-        row_idx: int,
-        col_idx: int,
-        cell_text: str,
-        apply_bold: bool = False,
-    ) -> bool:
-        """
-        Populate a single cell with text, with optional bold formatting.
-
-        Returns True if successful, False otherwise.
-        """
-        try:
-            # Get fresh table structure to avoid index shifting issues
-            tables = await self._get_document_tables(document_id)
-            if not tables:
-                return False
-
-            table = tables[-1]  # Use the last table (newly created one)
-            cells = table.get("cells", [])
-
-            # Bounds checking
-            if row_idx >= len(cells) or col_idx >= len(cells[row_idx]):
-                logger.error(f"Cell ({row_idx},{col_idx}) out of bounds")
-                return False
-
-            cell = cells[row_idx][col_idx]
-            insertion_index = cell.get("insertion_index")
-
-            if not insertion_index:
-                logger.warning(f"No insertion_index for cell ({row_idx},{col_idx})")
-                return False
-
-            # Insert text
-            await asyncio.to_thread(
-                self.service.documents()
-                .batchUpdate(
-                    documentId=document_id,
-                    body={
-                        "requests": [
-                            {
-                                "insertText": {
-                                    "location": {"index": insertion_index},
-                                    "text": cell_text,
-                                }
-                            }
-                        ]
-                    },
-                )
-                .execute
-            )
-
-            # Apply bold formatting if requested
-            if apply_bold:
-                await self._apply_bold_formatting(
-                    document_id, insertion_index, insertion_index + len(cell_text)
-                )
-
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to populate single cell: {str(e)}")
-            return False
-
-    async def _apply_bold_formatting(
-        self, document_id: str, start_index: int, end_index: int
-    ) -> None:
-        """Apply bold formatting to a text range."""
-        await asyncio.to_thread(
-            self.service.documents()
-            .batchUpdate(
-                documentId=document_id,
-                body={
-                    "requests": [
-                        {
-                            "updateTextStyle": {
-                                "range": {
-                                    "startIndex": start_index,
-                                    "endIndex": end_index,
-                                },
-                                "textStyle": {"bold": True},
-                                "fields": "bold",
-                            }
-                        }
-                    ]
-                },
-            )
-            .execute
-        )
-
     async def populate_existing_table(
         self,
         document_id: str,
@@ -261,7 +225,11 @@ class TableOperationManager:
         clear_existing: bool = False,
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
-        Populate an existing table with data.
+        Populate an existing table with data using batch operations.
+
+        Uses 2 API calls:
+        1. documents().get() (read structure to get cell indices)
+        2. batchUpdate with all insertText ops (populate all cells at once)
 
         Args:
             document_id: ID of the document
@@ -296,16 +264,39 @@ class TableOperationManager:
                     {},
                 )
 
-            # Populate cells
-            population_count = await self._populate_existing_table_cells(
-                document_id, table_index, table_data
+            # Build batch requests for all cells
+            requests = build_table_population_requests(
+                table_info, table_data, bold_headers=False
             )
+
+            if not requests:
+                return (
+                    True,
+                    "No cell data to populate",
+                    {"table_index": table_index, "populated_cells": 0},
+                )
+
+            # Reverse cell group order for correct batch execution (end-to-start)
+            requests = _reverse_cell_groups(requests)
+
+            # Execute all cell insertions in a single batchUpdate
+            await asyncio.to_thread(
+                self.service.documents()
+                .batchUpdate(
+                    documentId=document_id,
+                    body={"requests": requests},
+                )
+                .execute
+            )
+
+            population_count = sum(1 for r in requests if "insertText" in r)
 
             metadata = {
                 "table_index": table_index,
                 "populated_cells": population_count,
                 "table_dimensions": f"{table_rows}x{table_cols}",
                 "data_dimensions": f"{data_rows}x{data_cols}",
+                "api_calls": 2,
             }
 
             return (
@@ -316,57 +307,3 @@ class TableOperationManager:
 
         except Exception as e:
             return False, f"Failed to populate existing table: {str(e)}", {}
-
-    async def _populate_existing_table_cells(
-        self, document_id: str, table_index: int, table_data: List[List[str]]
-    ) -> int:
-        """Populate cells in an existing table."""
-        population_count = 0
-
-        for row_idx, row_data in enumerate(table_data):
-            for col_idx, cell_text in enumerate(row_data):
-                if not cell_text:
-                    continue
-
-                # Get fresh table structure for each cell
-                tables = await self._get_document_tables(document_id)
-                if table_index >= len(tables):
-                    break
-
-                table = tables[table_index]
-                cells = table.get("cells", [])
-
-                if row_idx >= len(cells) or col_idx >= len(cells[row_idx]):
-                    continue
-
-                cell = cells[row_idx][col_idx]
-
-                # For existing tables, append to existing content
-                cell_end = cell["end_index"] - 1  # Don't include cell end marker
-
-                try:
-                    await asyncio.to_thread(
-                        self.service.documents()
-                        .batchUpdate(
-                            documentId=document_id,
-                            body={
-                                "requests": [
-                                    {
-                                        "insertText": {
-                                            "location": {"index": cell_end},
-                                            "text": cell_text,
-                                        }
-                                    }
-                                ]
-                            },
-                        )
-                        .execute
-                    )
-                    population_count += 1
-
-                except Exception as e:
-                    logger.error(
-                        f"Failed to populate existing cell ({row_idx},{col_idx}): {str(e)}"
-                    )
-
-        return population_count
