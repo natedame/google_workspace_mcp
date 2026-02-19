@@ -14,9 +14,13 @@ The patch intercepts the session handling and recovers by:
 1. Detecting when a request has an unknown session ID
 2. Logging a warning about the stale session
 3. Creating a new session instead of returning an error
+
+Session limits prevent unbounded memory growth from polling clients that
+repeatedly create new sessions without reusing existing ones.
 """
 
 import logging
+import time
 from http import HTTPStatus
 from uuid import uuid4
 
@@ -30,6 +34,51 @@ logger = logging.getLogger(__name__)
 
 _original_handle_stateful_request = None
 
+# Maximum number of concurrent sessions before we start rejecting new ones.
+# This prevents unbounded memory growth from polling clients.
+MAX_SESSIONS = 100
+
+# Track session creation times for cleanup of idle sessions
+_session_last_active: dict[str, float] = {}
+
+# Sessions older than this (seconds) with no activity are eligible for cleanup
+SESSION_IDLE_TIMEOUT = 300  # 5 minutes
+
+
+def _cleanup_idle_sessions(manager) -> int:
+    """Remove sessions that have been idle longer than SESSION_IDLE_TIMEOUT.
+
+    Args:
+        manager: The StreamableHTTPSessionManager instance
+
+    Returns:
+        Number of sessions cleaned up
+    """
+    now = time.monotonic()
+    to_remove = []
+    for sid, last_active in list(_session_last_active.items()):
+        if now - last_active > SESSION_IDLE_TIMEOUT:
+            to_remove.append(sid)
+
+    cleaned = 0
+    for sid in to_remove:
+        _session_last_active.pop(sid, None)
+        transport = manager._server_instances.pop(sid, None)
+        if transport is not None:
+            cleaned += 1
+            # Terminate the transport to free resources
+            try:
+                transport.is_terminated = True
+            except Exception:
+                pass
+
+    if cleaned > 0:
+        logger.info(
+            f"Cleaned up {cleaned} idle sessions (>{SESSION_IDLE_TIMEOUT}s inactive). "
+            f"Active sessions: {len(manager._server_instances)}"
+        )
+    return cleaned
+
 
 async def _patched_handle_stateful_request(
     self,
@@ -40,6 +89,8 @@ async def _patched_handle_stateful_request(
     """
     Patched version of _handle_stateful_request that handles unknown session IDs
     gracefully by creating new sessions instead of returning 400 errors.
+
+    Includes session limits and idle cleanup to prevent unbounded memory growth.
     """
     from mcp.server.streamable_http import (
         MCP_SESSION_ID_HEADER,
@@ -55,11 +106,13 @@ async def _patched_handle_stateful_request(
         and request_mcp_session_id in self._server_instances
     ):
         transport = self._server_instances[request_mcp_session_id]
+        # Update last-active time
+        _session_last_active[request_mcp_session_id] = time.monotonic()
         logger.debug("Session already exists, handling request directly")
         await transport.handle_request(scope, receive, send)
         return
 
-    # NEW: Handle unknown session ID gracefully - create a new session
+    # Handle unknown session ID gracefully - create a new session
     # but also map the old session ID to the new transport for continuity
     stale_session_id = None
     if request_mcp_session_id is not None:
@@ -73,6 +126,24 @@ async def _patched_handle_stateful_request(
     # New session case (or recovery from unknown session)
     logger.debug("Creating new transport")
     async with self._session_creation_lock:
+        # Enforce session limit: clean up idle sessions first, then check limit
+        current_count = len(self._server_instances)
+        if current_count >= MAX_SESSIONS:
+            cleaned = _cleanup_idle_sessions(self)
+            current_count = len(self._server_instances)
+
+            if current_count >= MAX_SESSIONS:
+                logger.error(
+                    f"Session limit reached ({MAX_SESSIONS} active sessions, "
+                    f"cleaned {cleaned} idle). Rejecting new session request."
+                )
+                response = Response(
+                    content="Too many active sessions. Please retry later.",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                await response(scope, receive, send)
+                return
+
         # For stale session recovery, reuse the client's session ID
         # This allows the client to continue using their existing session ID
         # without needing to handle session ID changes
@@ -94,7 +165,11 @@ async def _patched_handle_stateful_request(
 
         assert http_transport.mcp_session_id is not None
         self._server_instances[http_transport.mcp_session_id] = http_transport
-        logger.info(f"Created new transport with session ID: {new_session_id[:8]}...")
+        _session_last_active[http_transport.mcp_session_id] = time.monotonic()
+        logger.info(
+            f"Created new transport with session ID: {new_session_id[:8]}... "
+            f"(active sessions: {len(self._server_instances)})"
+        )
 
         # Define the server runner
         async def run_server(
@@ -116,18 +191,18 @@ async def _patched_handle_stateful_request(
                         exc_info=True,
                     )
                 finally:
-                    # Only remove from instances if not terminated
-                    if (
-                        http_transport.mcp_session_id
-                        and http_transport.mcp_session_id in self._server_instances
-                        and not http_transport.is_terminated
-                    ):
-                        logger.info(
-                            "Cleaning up crashed session "
-                            f"{http_transport.mcp_session_id} from "
-                            "active instances."
-                        )
-                        del self._server_instances[http_transport.mcp_session_id]
+                    # Clean up from instances and tracking
+                    sid = http_transport.mcp_session_id
+                    if sid:
+                        _session_last_active.pop(sid, None)
+                        if (
+                            sid in self._server_instances
+                            and not http_transport.is_terminated
+                        ):
+                            logger.info(
+                                f"Cleaning up crashed session {sid} from active instances."
+                            )
+                            del self._server_instances[sid]
 
         # Assert task group is not None for type checking
         assert self._task_group is not None

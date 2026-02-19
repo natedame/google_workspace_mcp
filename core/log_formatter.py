@@ -6,6 +6,7 @@ to match the safe_print output format.
 """
 
 import logging
+import logging.handlers
 import os
 import re
 import sys
@@ -186,7 +187,11 @@ def configure_file_logging(logger_name: str = None) -> bool:
         log_file_dir = os.path.dirname(log_file_dir)
         log_file_path = os.path.join(log_file_dir, "mcp_server_debug.log")
 
-        file_handler = logging.FileHandler(log_file_path, mode="a")
+        # Use RotatingFileHandler to prevent unbounded log growth.
+        # Max 10MB per file, keep 2 backups (30MB total max).
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file_path, mode="a", maxBytes=10 * 1024 * 1024, backupCount=2
+        )
         file_handler.setLevel(logging.DEBUG)
 
         file_formatter = logging.Formatter(
