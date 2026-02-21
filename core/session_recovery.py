@@ -36,13 +36,24 @@ _original_handle_stateful_request = None
 
 # Maximum number of concurrent sessions before we start rejecting new ones.
 # This prevents unbounded memory growth from polling clients.
-MAX_SESSIONS = 100
+# Reduced from 100: single-user deployment rarely needs >20 concurrent sessions.
+# OOM crashes (SIGKILL/exit-9) were caused by sessions accumulating to 100
+# before cleanup triggered, each holding transport/stream state in memory.
+MAX_SESSIONS = 30
 
 # Track session creation times for cleanup of idle sessions
 _session_last_active: dict[str, float] = {}
 
-# Sessions older than this (seconds) with no activity are eligible for cleanup
-SESSION_IDLE_TIMEOUT = 300  # 5 minutes
+# Sessions older than this (seconds) with no activity are eligible for cleanup.
+# Reduced from 300s: health-check polling creates ~7 sessions per 30s cycle,
+# so 300s allowed ~70 sessions to accumulate before expiry. At 120s, idle
+# sessions are cleaned before they pile up to OOM-inducing levels.
+SESSION_IDLE_TIMEOUT = 120  # 2 minutes
+
+# Proactive cleanup interval — run cleanup periodically, not just when MAX_SESSIONS hit.
+# This prevents the sawtooth pattern where sessions grow to MAX then bulk-purge.
+_PROACTIVE_CLEANUP_INTERVAL = 60  # seconds
+_last_proactive_cleanup: float = 0.0
 
 
 def _cleanup_idle_sessions(manager) -> int:
@@ -97,8 +108,18 @@ async def _patched_handle_stateful_request(
         StreamableHTTPServerTransport,
     )
 
+    global _last_proactive_cleanup
+
     request = Request(scope, receive)
     request_mcp_session_id = request.headers.get(MCP_SESSION_ID_HEADER)
+
+    # Proactive cleanup: run periodically on every request to prevent session buildup.
+    # This avoids the sawtooth pattern where sessions accumulate to MAX_SESSIONS
+    # before any cleanup happens, which was the root cause of OOM crashes.
+    now = time.monotonic()
+    if now - _last_proactive_cleanup > _PROACTIVE_CLEANUP_INTERVAL:
+        _last_proactive_cleanup = now
+        _cleanup_idle_sessions(self)
 
     # Existing session case
     if (

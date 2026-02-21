@@ -1,8 +1,10 @@
 import argparse
 import logging
 import os
+import resource
 import socket
 import sys
+import threading
 from importlib import metadata, import_module
 from dotenv import load_dotenv
 
@@ -316,6 +318,34 @@ def main():
     else:
         safe_print("🔍 Skipping credentials directory check (stateless mode)")
         safe_print("")
+
+    # Start periodic memory health logging — emits RSS/heap/session stats every 5 min.
+    # This provides data for diagnosing OOM crashes (SIGKILL exit-9) that previously
+    # left no trace in logs.
+    def _memory_health_logger():
+        import time as _time
+        while True:
+            _time.sleep(5 * 60)  # 5 minutes
+            try:
+                ru = resource.getrusage(resource.RUSAGE_SELF)
+                rss_mb = ru.ru_maxrss / (1024 * 1024)  # macOS reports bytes
+                # Try to get active session count from session_recovery module
+                try:
+                    from core.session_recovery import _session_last_active
+                    sessions = len(_session_last_active)
+                except Exception:
+                    sessions = -1
+                uptime = _time.time() - _startup_time
+                logger.info(
+                    f"[Health] uptime={int(uptime)}s rss={rss_mb:.0f}MB "
+                    f"sessions={sessions}"
+                )
+            except Exception as e:
+                logger.warning(f"[Health] failed to collect metrics: {e}")
+
+    _startup_time = __import__('time').time()
+    _health_thread = threading.Thread(target=_memory_health_logger, daemon=True)
+    _health_thread.start()
 
     try:
         # Set transport mode for OAuth callback handling
